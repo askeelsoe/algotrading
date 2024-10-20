@@ -1,0 +1,158 @@
+from AlgorithmImports import *
+import pandas as pd
+from io import StringIO
+from datetime import datetime
+import matplotlib.pyplot as plt
+
+class CustomWeatherData(PythonData):
+    def get_source(self, config: SubscriptionDataConfig, date: datetime, is_live_mode: bool) -> SubscriptionDataSource:
+        url = "https://raw.githubusercontent.com/askeelsoe/QC/refs/heads/main/Sorted_Shifted_WeatherData_QuantConnect.csv"
+        return SubscriptionDataSource(url, SubscriptionTransportMedium.REMOTE_FILE)
+
+    def reader(self, config: SubscriptionDataConfig, line: str, date: datetime, is_live_mode: bool) -> BaseData:
+        if not (line.strip() and line[0].isdigit()):
+            return None
+        data = line.split(',')
+        precipitation = CustomWeatherData()
+        precipitation.Symbol = config.Symbol
+        # Set the time to the start of the day to match the slice object
+        precipitation.Time = datetime.strptime(data[0], '%Y-%m-%d').replace(hour=15, minute=0, second=0)
+        precipitation.value = float(data[1])
+        precipitation["Precipitation"] = float(data[1])
+        return precipitation
+
+class RainBasedTrading(QCAlgorithm):
+    def initialize(self):
+        self._precipitation_limit = 0.5
+        self.set_start_date(2021, 12, 31)
+        self.set_end_date(2024, 9, 30)
+        self.initial_cash = 100000
+        self.set_cash(self.initial_cash)
+        spy = self.add_equity("SPY", Resolution.DAILY)
+        spy.set_data_normalization_mode(DataNormalizationMode.SPLIT_ADJUSTED)
+        self.spy = spy.symbol
+        self.set_benchmark("SPY")
+        self.transactions.market_order_fill_timeout = timedelta(seconds=30)
+        self.daily_portfolio_values = []
+        self.daily_benchmark_values = []
+        self.initial_portfolio_value = None
+        self.initial_benchmark_value = None
+        self.tomorrow_precipitation_forecast = 0.0
+        self.open_short_counter = 0
+        self.closed_short_counter = 0
+        self.last_price = 0
+        self.set_risk_free_interest_rate_model(ConstantRiskFreeRateInterestRateModel(0.03))
+        # Schedule event to manage trades before market close
+        self.schedule.on(
+            self.date_rules.every_day(self.spy),
+            self.time_rules.before_market_close(self.spy, 10),  # 30 minutes before market close
+            self.manage_trades
+        )
+        # Subscribe to custom weather data
+        self.weather_symbol = self.add_data(CustomWeatherData, "WeatherData", Resolution.DAILY).symbol
+        self.log(f"Subscribed to weather data with symbol: {self.weather_symbol}")
+
+        # Create and add chart
+        chart = Chart("Performance")
+        self.add_chart(chart)
+
+        # Create and add series
+        equity_series = Series("Equity", SeriesType.LINE, "$", Color.BLUE)
+        benchmark_series = Series("Benchmark", SeriesType.LINE, "$", Color.GRAY)
+        chart.add_series(equity_series)
+        chart.add_series(benchmark_series)
+
+    def on_data(self, slice: Slice) -> None:
+        # Lets see if we have precipitation data
+        if slice.contains_key(self.weather_symbol):
+            weather_data = slice[self.weather_symbol]
+            self.tomorrow_precipitation_forecast = weather_data["Precipitation"]
+            if self.tomorrow_precipitation_forecast > self._precipitation_limit:
+                self.log(f"Lots of rain comming!! {self.tomorrow_precipitation_forecast}\"!")
+            
+        if self.spy not in slice.bars:
+            return
+        
+        # Get the price of SPY for calculations and order posting
+        self.last_price = slice.bars[self.spy].close
+
+        # Capture initial values
+        if self.initial_portfolio_value is None:
+            self.initial_portfolio_value = self.portfolio.total_portfolio_value
+        if self.initial_benchmark_value is None:
+            self.initial_benchmark_value = self.last_price
+
+        # Calculate indexed values
+        indexed_portfolio_value = (self.portfolio.total_portfolio_value / self.initial_portfolio_value) * 100
+        indexed_benchmark_value = (self.last_price / self.initial_benchmark_value) * 100
+        
+        self.daily_portfolio_values.append(self.portfolio.total_portfolio_value)
+        self.daily_benchmark_values.append(self.last_price)
+
+        # Plot indexed values
+        self.plot("Performance", "Equity", indexed_portfolio_value)
+        self.plot("Performance", "Benchmark", indexed_benchmark_value)
+    
+    def manage_trades(self) -> None:
+        if self.tomorrow_precipitation_forecast is not 0 and self.last_price is not 0:
+            # If tomorrow's forecast indicates sufficent precipitation, short SPY
+            if self.tomorrow_precipitation_forecast >= self._precipitation_limit and self.portfolio[self.spy].quantity >= 0:
+                if self.portfolio[self.spy].quantity > 0:
+                    quantity = self.portfolio[self.spy].quantity * 2
+                    self.sell(self.spy, quantity)
+                    self.log(f"Shorted {quantity / 2} due to bad weather comming.")
+                else:
+                    quantity = int(self.portfolio.cash / self.last_price)
+                    self.log(f"Shorted {quantity / 2} due to bad weather comming.")
+                    self.sell(self.spy, quantity)
+                self.open_short_counter += 1
+
+            # If today is a precipitation day and we are short, check if we should close the position
+            if self.tomorrow_precipitation_forecast < self._precipitation_limit and self.portfolio[self.spy].quantity < 0:
+                self.liquidate(self.spy)
+                self.log("Closed short position on SPY due to no rain forecast for tomorrow.")
+                self.closed_short_counter += 1
+        
+            # Go long if we are not already:
+            if self.portfolio[self.spy].quantity == 0 and self.tomorrow_precipitation_forecast < self._precipitation_limit and self.last_price is not 0:
+                quantity = int(self.portfolio.cash / self.last_price)
+                self.log(f"Openning long position on {quantity} shares of spy.")
+                self.market_order(self.spy, quantity)
+
+
+    def on_end_of_algorithm(self) -> None:
+        final_portfolio_value = self.portfolio.total_portfolio_value
+        if self.initial_benchmark_value is None:
+            self.log("Initial benchmark value was not captured.")
+            return
+        final_history = self.history(self.spy, self.end_date - timedelta(days=1), self.end_date)
+        if final_history.empty:
+            self.log("No final benchmark data available.")
+            return
+        final_benchmark_value = final_history.iloc[0].close
+        benchmark_performance = (final_benchmark_value / self.initial_benchmark_value - 1) * 100
+        strategy_performance = (final_portfolio_value / self.initial_cash - 1) * 100
+        portfolio_returns = pd.Series(self.daily_portfolio_values).pct_change().dropna()
+        benchmark_history = self.history(self.spy, self.start_date, self.end_date, Resolution.DAILY)
+        benchmark_returns = benchmark_history['close'].pct_change().dropna()
+        portfolio_volatility = portfolio_returns.std()
+        benchmark_volatility = benchmark_returns.std()
+        risk_free_rate = 0.03 / 252
+        portfolio_sharpe_ratio = (portfolio_returns.mean() - risk_free_rate) / portfolio_volatility
+        benchmark_sharpe_ratio = (benchmark_returns.mean() - risk_free_rate) / benchmark_volatility
+
+        # Annualize the Sharpe Ratios
+        annualized_portfolio_sharpe_ratio = portfolio_sharpe_ratio * (252 ** 0.5)
+        annualized_benchmark_sharpe_ratio = benchmark_sharpe_ratio * (252 ** 0.5)
+
+        self.log(f"Final Portfolio Value: {final_portfolio_value}")
+        self.log(f"Strategy Performance: {strategy_performance:.2f}%")
+        self.log(f"Benchmark Performance: {benchmark_performance:.2f}%")
+        self.log(f"Portfolio Sharpe Ratio: {portfolio_sharpe_ratio:.5f}")
+        self.log(f"Benchmark Sharpe Ratio: {benchmark_sharpe_ratio:.5f}")
+        self.log(f"Annualized Portfolio Sharpe Ratio: {annualized_portfolio_sharpe_ratio:.5f}")
+        self.log(f"Annualized Benchmark Sharpe Ratio: {annualized_benchmark_sharpe_ratio:.5f}")
+        self.log(f"Open short counter: {self.open_short_counter}")
+        self.log(f"Closed short counter: {self.closed_short_counter}")
+    
+        
